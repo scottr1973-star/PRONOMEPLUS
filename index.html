@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>ProNome — Poly4 (32-Beat) — Recorder + Custom Samples + Delete</title>
+<title>ProNome — Poly4 (32-Beat) — Recorder + Custom Samples + Delete (PCM mic fix)</title>
 <style>
   :root{
     --bg:#0b0f0c;--panel:#111718;--panel2:#0e1416;--ink:#e8f5e9;--muted:#9fb3a9;--line:rgba(255,255,255,.08);
@@ -119,7 +119,7 @@
 <body>
 <div class="wrap">
   <h1>ProNome — Poly4 (32-Beat)</h1>
-  <div class="sub">Metronome core, visualizer, recorder, presets — with Custom Samples (load & delete).</div>
+  <div class="sub">Metronome core, visualizer, recorder, presets — with Custom Samples (load & delete). Mic capture is raw PCM (no browser gating).</div>
 
   <div class="grid">
     <div class="left-group">
@@ -295,7 +295,7 @@
 
   function initAudio(){
     if (audioCtx) return;
-    audioCtx=new (window.AudioContext||window.webkitAudioContext)();
+    audioCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:48000});
     // Built-ins
     bank.kick=playBass; bank.snare=playSnare; bank.hihat=playHiHat; bank.cowbell=playCowbell;
     bank.woodblock=playWoodBlock; bank.shaker=playShaker; bank.nclap=playClap; bank.tom=playLowTom; bank.hightom=playHighTom;
@@ -303,85 +303,254 @@
     rt.forEach((r,i)=>{ const g=audioCtx.createGain(); g.gain.value=defaultLayers[i].vol; g.connect(audioCtx.destination); r.gain=g; });
   }
 
-  /* ------------ Recorder (mic: raw music) ------------ */
-  let mediaStream=null, mediaRec=null, fallbackRec=null, chunks=[], recordingBlob=null, recBusy=false, isRecording=false;
-  function getBestMime(){ const c=['audio/webm;codecs=opus','audio/webm','audio/ogg;codecs=opus','audio/mp4']; for(const m of c){ if(window.MediaRecorder && MediaRecorder.isTypeSupported(m)) return m; } return ''; }
+  /* ------------ Recorder (RAW PCM: AudioWorklet -> WAV) ------------ */
+  // No MediaRecorder at all: removes codec/VAD/high-pass artifacts.
+  let mediaStream=null, micSource=null, workletNode=null, spFallback=null;
+  let isRecording=false, recBusy=false, pcmChunks=[], recordingBlob=null;
+
+  function getBestConstraints(){
+    const base = {
+      channelCount: { ideal: 1, min: 1, max: 1 },
+      echoCancellation: false,
+      noiseSuppression: false,
+      autoGainControl: false,
+      sampleRate: 48000
+    };
+    const advanced = [
+      { echoCancellation: false },
+      { noiseSuppression: false },
+      { autoGainControl: false },
+      { googEchoCancellation: false },
+      { googNoiseSuppression: false },
+      { googAutoGainControl: false },
+      { googHighpassFilter: false },
+      { voiceIsolation: false }
+    ];
+    return { audio: { ...base, advanced }, video: false };
+  }
+
   async function getRawMicStream(){
-    const base={channelCount:1,echoCancellation:false,noiseSuppression:false,autoGainControl:false,sampleRate:48000};
-    const adv=[{echoCancellation:false},{noiseSuppression:false},{autoGainControl:false},{googEchoCancellation:false},{googNoiseSuppression:false},{googAutoGainControl:false},{googHighpassFilter:false},{voiceIsolation:false}];
-    const s=await navigator.mediaDevices.getUserMedia({audio:{...base,advanced:adv},video:false});
-    const t=s.getAudioTracks()[0]; try{ if('contentHint' in t) t.contentHint='music'; await t.applyConstraints({...base,advanced:adv}); }catch{}
-    return s;
+    const stream = await navigator.mediaDevices.getUserMedia(getBestConstraints());
+    const track = stream.getAudioTracks()[0];
+    try{
+      if ('contentHint' in track) track.contentHint = 'music';
+      await track.applyConstraints(getBestConstraints().audio);
+    }catch{}
+    return stream;
   }
-  function getNoiseBuffer(dur=0.5){ const sr=audioCtx.sampleRate, len=dur*sr, b=audioCtx.createBuffer(1,len,sr), d=b.getChannelData(0); for(let i=0;i<len;i++) d[i]=Math.random()*2-1; return b; }
-  function createFallbackRecorder(src,ctx){
-    const rec={isRecording:false,_bufs:[],_script:null,_sr:ctx.sampleRate,
-      start(){ if(this.isRecording) return; this._bufs=[]; const sp=ctx.createScriptProcessor(2048,1,1); src.connect(sp); sp.onaudioprocess=(ev)=>{ if(!this.isRecording) return; this._bufs.push(new Float32Array(ev.inputBuffer.getChannelData(0))); }; this._script=sp; this.isRecording=true; },
-      stop(){ if(!this.isRecording) return; this.isRecording=false; try{this._script.disconnect();}catch{} try{src.disconnect(this._script);}catch{} },
-      getAudioBuffer(){ const total=this._bufs.reduce((s,a)=>s+a.length,0); if(!total) return null; const out=ctx.createBuffer(1,total,this._sr), o=out.getChannelData(0); let off=0; for(const a of this._bufs){ o.set(a,off); off+=a.length; } return out; }
-    }; return rec;
+
+  async function ensureWorklet(){
+    if(!audioCtx) initAudio();
+    if (audioCtx.audioWorklet && !window.__recorderModuleLoaded) {
+      const code = `
+        class RecorderProcessor extends AudioWorkletProcessor {
+          process (inputs) {
+            const input = inputs[0];
+            if (input && input[0]) {
+              // Copy the frame so the main thread gets a stable buffer
+              const copy = new Float32Array(input[0].length);
+              copy.set(input[0]);
+              this.port.postMessage(copy, [copy.buffer]);
+            }
+            return true;
+          }
+        }
+        registerProcessor('recorder-processor', RecorderProcessor);
+      `;
+      const blob = new Blob([code], {type:'application/javascript'});
+      const url = URL.createObjectURL(blob);
+      await audioCtx.audioWorklet.addModule(url);
+      URL.revokeObjectURL(url);
+      window.__recorderModuleLoaded = true;
+    }
   }
-  function bufferToWavBlob(buffer){ const wav=encodeWAV(buffer); return new Blob([wav],{type:'audio/wav'}); }
-  function encodeWAV(buffer){
-    const nc=1, sr=buffer.sampleRate, d=buffer.getChannelData(0), l=d.length;
-    const ab=new ArrayBuffer(44+l*2), v=new DataView(ab);
-    const W=(o,s)=>{ for(let i=0;i<s.length;i++) v.setUint8(o+i,s.charCodeAt(i)); };
-    W(0,'RIFF'); v.setUint32(4,36+l*2,true); W(8,'WAVE'); W(12,'fmt '); v.setUint32(16,16,true);
-    v.setUint16(20,1,true); v.setUint16(22,nc,true); v.setUint32(24,sr,true); v.setUint32(28,sr*nc*2,true); v.setUint16(32,nc*2,true); v.setUint16(34,16,true); W(36,'data'); v.setUint32(40,l*2,true);
-    let off=44; for(let i=0;i<l;i++){ let s=Math.max(-1,Math.min(1,d[i])); v.setInt16(off, s<0?s*0x8000:s*0x7fff, true); off+=2; }
-    return v;
+
+  function createScriptProcessorFallback(sourceNode){
+    const rec = {
+      node: null, bufs: [], isOn:false,
+      start(ctx){
+        if (this.isOn) return;
+        const sp = ctx.createScriptProcessor(2048, 1, 1);
+        sourceNode.connect(sp);
+        sp.onaudioprocess = (ev) => {
+          if (!this.isOn) return;
+          const ch = ev.inputBuffer.getChannelData(0);
+          const copy = new Float32Array(ch.length);
+          copy.set(ch);
+          this.bufs.push(copy);
+        };
+        this.node = sp;
+        this.isOn = true;
+      },
+      stop(){
+        if(!this.isOn) return;
+        this.isOn = false;
+        try{ this.node.disconnect(); }catch{}
+        try{ sourceNode.disconnect(this.node); }catch{}
+      },
+      take(){
+        const out = this.bufs; this.bufs = []; return out;
+      }
+    };
+    return rec;
   }
+
+  function concatFloat32(chunks){
+    const total = chunks.reduce((s,a)=>s+a.length,0);
+    const out = new Float32Array(total);
+    let o = 0;
+    for(const a of chunks){ out.set(a, o); o += a.length; }
+    return out;
+  }
+
+  function float32ToWavBlob(float32, sampleRate){
+    // Build WAV (mono, 16-bit)
+    const len = float32.length;
+    const buffer = new ArrayBuffer(44 + len*2);
+    const view = new DataView(buffer);
+    const writeString = (off, str)=>{ for(let i=0;i<str.length;i++) view.setUint8(off+i, str.charCodeAt(i)); };
+    writeString(0, 'RIFF');
+    view.setUint32(4, 36 + len*2, true);
+    writeString(8, 'WAVE');
+    writeString(12,'fmt ');
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true); // PCM
+    view.setUint16(22, 1, true); // mono
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate*2, true); // byte rate
+    view.setUint16(32, 2, true); // block align
+    view.setUint16(34, 16, true); // bits
+    writeString(36, 'data');
+    view.setUint32(40, len*2, true);
+    let off = 44;
+    for (let i=0;i<len;i++){
+      let s = Math.max(-1, Math.min(1, float32[i]));
+      view.setInt16(off, s < 0 ? s * 0x8000 : s * 0x7FFF, true);
+      off += 2;
+    }
+    return new Blob([view], {type:'audio/wav'});
+  }
+
   async function initRecorder(){
     if(!audioCtx) initAudio();
-    if(recBusy) return false; recBusy=true;
-    recordBtn.disabled=playbackBtn.disabled=exportRec.disabled=true; audioPlayer.style.display='none';
-    if(!navigator.mediaDevices || !window.MediaRecorder){ recStatus.textContent='Recording not supported.'; recBusy=false; return false; }
-    if(!mediaStream){ try{ recStatus.textContent='Requesting mic permission...'; mediaStream=await getRawMicStream(); }catch(e){ recStatus.textContent=`Mic access denied: ${e.name}`; recBusy=false; return false; } }
-    if(!mediaRec && window.MediaRecorder && MediaRecorder.isTypeSupported(getBestMime())){ try{ mediaRec=new MediaRecorder(mediaStream,{mimeType:getBestMime()}); mediaRec.ondataavailable=(e)=>{ if(e.data && e.data.size) chunks.push(e.data); }; mediaRec.onstop=onRecordingComplete; }catch{} }
-    if(!fallbackRec){ const inputNode=audioCtx.createMediaStreamSource(mediaStream); fallbackRec=createFallbackRecorder(inputNode,audioCtx); }
-    recStatus.textContent='Microphone ready.'; recordBtn.textContent='Record'; recordBtn.disabled=false; recBusy=false; return true;
-  }
-  recordBtn.addEventListener('click', async ()=>{
-    if(isRecording){ stopRecording(); return; }
-    if(!mediaStream){ const ok=await initRecorder(); if(!ok) return; }
-    if(audioPlayer.src) URL.revokeObjectURL(audioPlayer.src);
-    recordingBlob=null; chunks=[];
-    recordBtn.textContent='Stop'; recordBtn.classList.add('recording');
-    playbackBtn.disabled=exportRec.disabled=true; audioPlayer.style.display='none';
-    recLight.classList.add('on'); isRecording=true; recStatus.textContent='RECORDING...';
-    if(mediaRec){ try{ mediaRec.start(); }catch(e){ recStatus.textContent='MediaRecorder failed.'; isRecording=false; recLight.classList.remove('on'); } }
-    else if(fallbackRec){ fallbackRec.start(); }
-    else { recStatus.textContent='No available recorder.'; isRecording=false; recLight.classList.remove('on'); }
-  });
-  function stopRecording(){
-    if(!isRecording) return; isRecording=false;
-    recordBtn.textContent='Processing...'; recordBtn.disabled=true; recordBtn.classList.remove('recording');
-    recLight.classList.remove('on'); recStatus.textContent='Processing...';
-    if(mediaRec && mediaRec.state==='recording') mediaRec.stop();
-    else if(fallbackRec && fallbackRec.isRecording){ fallbackRec.stop(); onRecordingComplete(); }
-    else onRecordingComplete();
-  }
-  async function onRecordingComplete(){
-    let buf=null;
-    if(mediaRec && chunks.length>0){
-      const mime=chunks[0]?.type||getBestMime()||'audio/webm';
-      const webmBlob=new Blob(chunks,{type:mime});
-      let ab; try{ ab=await webmBlob.arrayBuffer(); }catch{ recStatus.textContent='Processing error.'; return; }
-      buf=await audioCtx.decodeAudioData(ab).catch(()=>null);
-    } else if(fallbackRec && fallbackRec._bufs.length>0){
-      buf=fallbackRec.getAudioBuffer();
+    if(recBusy) return false; recBusy = true;
+
+    recordBtn.disabled = playbackBtn.disabled = exportRec.disabled = true;
+    audioPlayer.style.display = 'none';
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
+      recStatus.textContent = 'Recording not supported.';
+      recBusy = false; return false;
     }
-    if(!buf){ recStatus.textContent='Recording failed or too short.'; recordBtn.disabled=false; recordBtn.textContent='Record'; return; }
-    recordingBlob=bufferToWavBlob(buf);
-    audioPlayer.src=URL.createObjectURL(recordingBlob); audioPlayer.style.display='block';
-    recStatus.textContent=`Recording ready. (${(recordingBlob.size/1024).toFixed(1)} KB WAV)`;
-    recordBtn.textContent='Re-Record'; recordBtn.disabled=false; playbackBtn.disabled=false; exportRec.disabled=false;
+
+    try{
+      recStatus.textContent = 'Requesting mic permission...';
+      if(!mediaStream) mediaStream = await getRawMicStream();
+    }catch(e){
+      recStatus.textContent = `Mic access denied: ${e.name}`;
+      recBusy = false; return false;
+    }
+
+    // Build nodes once
+    if (!micSource) micSource = audioCtx.createMediaStreamSource(mediaStream);
+
+    // Preferred: AudioWorklet
+    await ensureWorklet();
+
+    if (audioCtx.audioWorklet) {
+      if (!workletNode) {
+        workletNode = new AudioWorkletNode(audioCtx, 'recorder-processor', {numberOfInputs:1, numberOfOutputs:0, channelCount:1});
+        micSource.connect(workletNode);
+        // Do NOT connect to destination (prevents OS echo path & any auto "enhancements")
+      }
+      recStatus.textContent = 'Microphone ready (raw PCM, worklet).';
+    } else {
+      if (!spFallback) spFallback = createScriptProcessorFallback(micSource, audioCtx);
+      recStatus.textContent = 'Microphone ready (raw PCM, fallback).';
+    }
+
+    recordBtn.textContent = 'Record';
+    recordBtn.disabled = false;
+    recBusy = false;
+    return true;
   }
+
+  recordBtn.addEventListener('click', async () => {
+    if (isRecording) { stopRecording(); return; }
+    if (!mediaStream) { const ok = await initRecorder(); if (!ok) return; }
+
+    // Reset buffers
+    if (audioPlayer.src) URL.revokeObjectURL(audioPlayer.src);
+    recordingBlob = null; pcmChunks = [];
+
+    // UI
+    recordBtn.textContent = 'Stop';
+    recordBtn.classList.add('recording');
+    playbackBtn.disabled = true;
+    exportRec.disabled = true;
+    audioPlayer.style.display = 'none';
+    recLight.classList.add('on');
+    isRecording = true;
+    recStatus.textContent = 'RECORDING (raw PCM)…';
+
+    // Start capture
+    if (workletNode) {
+      workletNode.port.onmessage = (ev) => { if (isRecording) pcmChunks.push(new Float32Array(ev.data)); };
+    } else if (spFallback) {
+      spFallback.start(audioCtx);
+    }
+  });
+
+  function stopRecording(){
+    if (!isRecording) return;
+    isRecording = false;
+
+    recordBtn.textContent = 'Processing...';
+    recordBtn.disabled = true;
+    recordBtn.classList.remove('recording');
+    recLight.classList.remove('on');
+    recStatus.textContent = 'Processing WAV…';
+
+    if (spFallback) spFallback.stop();
+
+    onRecordingComplete();
+  }
+
+  async function onRecordingComplete(){
+    // Gather PCM frames
+    let frames = pcmChunks;
+    if (!frames.length && spFallback) frames = spFallback.take();
+    if (!frames.length){
+      recStatus.textContent = 'Recording failed or was too short.';
+      recordBtn.disabled = false;
+      recordBtn.textContent = 'Record';
+      return;
+    }
+
+    const merged = concatFloat32(frames);
+    const wav = float32ToWavBlob(merged, audioCtx.sampleRate);
+    recordingBlob = wav;
+
+    audioPlayer.src = URL.createObjectURL(recordingBlob);
+    audioPlayer.style.display = 'block';
+
+    recStatus.textContent = `Recording ready. (${(recordingBlob.size/1024).toFixed(1)} KB WAV @ ${audioCtx.sampleRate} Hz)`;
+
+    recordBtn.textContent = 'Re-Record';
+    recordBtn.disabled = false;
+    playbackBtn.disabled = false;
+    exportRec.disabled = false;
+
+    // free RAM
+    pcmChunks = [];
+  }
+
   playbackBtn.addEventListener('click',()=>{ if(audioPlayer.paused){ audioPlayer.play(); playbackBtn.textContent='Pause'; } else { audioPlayer.pause(); playbackBtn.textContent='Play'; } });
   audioPlayer.addEventListener('ended',()=>{ playbackBtn.textContent='Play'; });
   exportRec.addEventListener('click',()=>{ if(!recordingBlob) return; const url=URL.createObjectURL(recordingBlob); const a=document.createElement('a'); a.href=url; a.download=`metronome_practice_${Date.now()}.wav`; a.click(); setTimeout(()=>URL.revokeObjectURL(url),1500); });
 
   /* ------------ Built-in instruments ------------ */
+  function getNoiseBuffer(dur=0.5){ const sr=audioCtx.sampleRate, len=dur*sr, b=audioCtx.createBuffer(1,len,sr), d=b.getChannelData(0); for(let i=0;i<len;i++) d[i]=Math.random()*2-1; return b; }
   function playBass(time,dest,isAcc){ const o=audioCtx.createOscillator(), g=audioCtx.createGain(); o.type='sine'; const f=isAcc?50:40, pg=isAcc?1.0:0.9, d=isAcc?0.45:0.4; o.frequency.setValueAtTime(f,time); g.gain.setValueAtTime(pg,time); g.gain.exponentialRampToValueAtTime(0.0001,time+d); o.connect(g).connect(dest); o.start(time); o.stop(time+d+0.1); }
   function playSnare(time,dest,isAcc){ const n=audioCtx.createBufferSource(); n.buffer=getNoiseBuffer(0.2); const ng=audioCtx.createGain(), hp=audioCtx.createBiquadFilter(); ng.gain.setValueAtTime(isAcc?0.6:0.45,time); ng.gain.exponentialRampToValueAtTime(0.001,time+(isAcc?0.12:0.1)); hp.type='highpass'; hp.frequency.setValueAtTime(5000,time); const o=audioCtx.createOscillator(), og=audioCtx.createGain(); o.type='triangle'; o.frequency.setValueAtTime(isAcc?250:200,time); og.gain.setValueAtTime(isAcc?0.8:0.6,time); og.gain.exponentialRampToValueAtTime(0.001,time+(isAcc?0.06:0.05)); o.connect(og); n.connect(hp).connect(ng); const m=audioCtx.createChannelMerger(2); og.connect(m,0,0); ng.connect(m,0,1); m.connect(dest); o.start(time); n.start(time); o.stop(time+0.1); n.stop(time+0.2); }
   function playHiHat(time,dest,isAcc){ const s=audioCtx.createBufferSource(); s.buffer=getNoiseBuffer(0.2); const g=audioCtx.createGain(), f=audioCtx.createBiquadFilter(); f.type='highpass'; f.frequency.setValueAtTime(6500,time); g.gain.setValueAtTime(isAcc?0.6:0.5,time); g.gain.exponentialRampToValueAtTime(0.0001,time+(isAcc?0.09:0.08)); s.connect(f).connect(g).connect(dest); s.start(time); s.stop(time+0.1); }
@@ -638,8 +807,8 @@
   bpmDec.addEventListener('click',()=>{ applyBpm((Number.isFinite(bpmInput.valueAsNumber)?bpmInput.valueAsNumber:bpm)-1); bpmInput.value=''; bpmInput.placeholder=String(bpm); });
   measSet.addEventListener('click',()=>{ const v=measInput.valueAsNumber; applyMeasure(Number.isFinite(v)&&v>0?v:measureBeats); measInput.placeholder=String(measureBeats); measInput.value=''; measureBadge.textContent='/'+measureBeats; });
   measSlider.addEventListener('input',e=>{ applyMeasure(Number(e.target.value)); measInput.placeholder=String(measureBeats); measureBadge.textContent='/'+measureBeats; });
-  measInc.addEventListener('click',()=>{ applyMeasure((Number.isFinite(measInput.valueAsNumber)?measInput.valueAsNumber:measureBeats)+1); measInput.value=''; measInput.placeholder=String(measureBeats); measureBadge.textContent='/'+measureBeats; });
-  measDec.addEventListener('click',()=>{ applyMeasure((Number.isFinite(measInput.valueAsNumber)?measInput.valueAsNumber:measureBeats)-1); measInput.value=''; measInput.placeholder=String(measureBeats); measureBadge.textContent='/'+measureBeats; });
+  measInc.addEventListener('click',()=>{ applyMeasure((Number.isFinite(measInput.valueAsNumber)?measInput.valueAsNumber:measureBeats)+1); measInput.value=''; measInput.placeholder=String(measureBeats); });
+  measDec.addEventListener('click',()=>{ applyMeasure((Number.isFinite(measInput.valueAsNumber)?measInput.valueAsNumber:measureBeats)-1); measInput.value=''; measInput.placeholder=String(measureBeats); });
 
   startBtn.addEventListener('click',start);
   stopBtn .addEventListener('click',stop);
@@ -712,12 +881,15 @@
   }
 
   function buildLayers(){ layersEl.innerHTML=''; for(let i=0;i<defaultLayers.length;i++) layersEl.appendChild(renderLayerRow(i)); }
-  function buildStepUI(){ buildStepLights(); rebuildPeriods(false); rebuildCircle(); updateActive(); }
+  function buildStepUI(){ 
+    buildStepLights(); 
+    rebuildPeriods(false); 
+    rebuildCircle(); 
+    updateActive(); 
+  }
 
   // Prevent wheel changing number inputs
   document.addEventListener('wheel',(e)=>{ const el=document.activeElement; if(el && el.tagName==='INPUT' && el.type==='number') e.preventDefault(); },{passive:false});
-
-  async function addSamplesFromFilesUI(){ /* reserved if we add a visible button later */ }
 
   function buildAll(){
     loadPresetsFromStorage();
